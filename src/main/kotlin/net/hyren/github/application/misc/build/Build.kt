@@ -6,69 +6,117 @@ import com.redefantasy.core.shared.echo.packets.project.ProjectSuccessBuildEchoP
 import net.hyren.github.application.frameworks.Framework
 import net.hyren.github.application.frameworks.implementations.GradleFramework
 import net.hyren.github.application.frameworks.implementations.MavenFramework
+import org.apache.maven.shared.invoker.*
 import org.gradle.tooling.GradleConnectionException
 import org.gradle.tooling.GradleConnector
 import org.gradle.tooling.ResultHandler
+import java.io.File
 
 /**
- * @author Gutyerrez
+ * @author Gutyerrez and Alvaro Borges
  */
 class Build(
-	val id: Int,
-	val framework: Framework,
-	vararg val parameters: Any?
+    val id: Int,
+    val framework: Framework,
+    vararg val parameters: Any?
 ) {
 
-	fun start() {
-		if (framework is GradleFramework) {
-			val connector = parameters[0] as GradleConnector
-			val tasks = parameters.copyOfRange(
-				1,
-				parameters.size
-			).map { it.toString() }.toTypedArray()
+    fun start() {
 
-			val projectConnection = connector.connect()
-			val buildLauncher = projectConnection.newBuild()!!
+        if (framework is GradleFramework) {
 
-			buildLauncher.forTasks(*tasks)
-			buildLauncher.run(object : ResultHandler<Void> {
+            val connector = parameters[0] as GradleConnector
+            val tasks = parameters.copyOfRange(1, parameters.size)
+                .map { it.toString() }
+                .toTypedArray()
 
-				val startTime = System.currentTimeMillis()
+            val projectConnection = connector.connect()
+            val buildLauncher = projectConnection.newBuild()
 
-				init {
-					println("Build $id")
+            buildLauncher.forTasks(*tasks)
 
-					framework.onStart(id)
-				}
+            buildLauncher.run(object : ResultHandler<Void> {
 
-				override fun onComplete(
-					result: Void?
-				) {
-					val packet = ProjectSuccessBuildEchoPacket(
-						id,
-						System.currentTimeMillis() - startTime
-					)
+                private val startTime = System.currentTimeMillis()
 
-					CoreProvider.Databases.Redis.ECHO.provide().publishToAll(packet)
-				}
+                init {
+                    println("Gradle Build $id")
+                    framework.onStart(id)
+                }
 
-				override fun onFailure(
-					failure: GradleConnectionException?
-				) {
-					val packet = ProjectFailedBuildEchoPacket(
-						id,
-						failure?.message
-					)
+                override fun onComplete(result: Void?) {
+                    val packet = ProjectSuccessBuildEchoPacket(
+                        id,
+                        System.currentTimeMillis() - startTime
+                    )
 
-					CoreProvider.Databases.Redis.ECHO.provide().publishToAll(packet)
-				}
+                    CoreProvider.Databases.Redis.ECHO.provide()
+                        .publishToAll(packet)
 
-			})
+                    projectConnection.close()
+                }
 
-			projectConnection.close()
-		} else if (framework is MavenFramework) {
-			// make it later
-		}
-	}
+                override fun onFailure(failure: GradleConnectionException?) {
+                    val packet = ProjectFailedBuildEchoPacket(
+                        id,
+                        failure?.message
+                    )
 
+                    CoreProvider.Databases.Redis.ECHO.provide()
+                        .publishToAll(packet)
+
+                    projectConnection.close()
+                }
+            })
+
+        } else if (framework is MavenFramework) {
+
+            val projectDir = parameters[0] as File
+            val goals = parameters.copyOfRange(1, parameters.size)
+                .map { it.toString() }
+
+            val startTime = System.currentTimeMillis()
+
+            println("Maven Build $id")
+            framework.onStart(id)
+
+            val request = DefaultInvocationRequest().apply {
+                pomFile = File(projectDir, "pom.xml")
+                setGoals(goals)
+                isBatchMode = true
+            }
+
+            val invoker: Invoker = DefaultInvoker()
+
+            try {
+                val result = invoker.execute(request)
+
+                if (result.exitCode == 0) {
+                    val packet = ProjectSuccessBuildEchoPacket(
+                        id,
+                        System.currentTimeMillis() - startTime
+                    )
+
+                    CoreProvider.Databases.Redis.ECHO.provide()
+                        .publishToAll(packet)
+                } else {
+                    val packet = ProjectFailedBuildEchoPacket(
+                        id,
+                        "Maven build failed with exit code ${result.exitCode}"
+                    )
+
+                    CoreProvider.Databases.Redis.ECHO.provide()
+                        .publishToAll(packet)
+                }
+
+            } catch (ex: MavenInvocationException) {
+                val packet = ProjectFailedBuildEchoPacket(
+                    id,
+                    ex.message
+                )
+
+                CoreProvider.Databases.Redis.ECHO.provide().publishToAll(packet)
+            }
+        }
+    }
 }
